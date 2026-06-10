@@ -58,5 +58,23 @@
     "type": "bool",
     "hint": "开启后会在每次对话中注入「当前时间 + 工具使用引导」，让大模型主动识别日程意图并换算相对时间。关闭后建议改用人格(persona)加载 SKILL.md",
     "default": true
+  },
+  "daily_reminder_enabled": {
+    "description": "启用每日日程提醒",
+    "type": "bool",
+    "hint": "开启后，机器人会在每天指定时间主动把当天日程发送到指定会话",
+    "default": false
+  },
+  "daily_reminder_time": {
+    "description": "每日提醒时间",
+    "type": "string",
+    "hint": "24 小时制 HH:MM（按上面的时区），例如 08:00",
+    "default": "08:00"
+  },
+  "daily_reminder_session": {
+    "description": "提醒发送目标（会话标识）",
+    "type": "string",
+    "hint": "发送到哪个聊天/机器人。最简单的方式：在目标聊天里发送 /日历 订阅 自动填入；高级用户可手填 unified_msg_origin，如 aiocqhttp:FriendMessage:123456 或 aiocqhttp:GroupMessage:123456",
+    "default": ""
   }
 }

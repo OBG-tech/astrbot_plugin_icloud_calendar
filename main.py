@@ -28,7 +28,7 @@ import uuid
 from datetime import date, datetime, timedelta, timezone
 
 from astrbot.api import AstrBotConfig, logger
-from astrbot.api.event import AstrMessageEvent, filter
+from astrbot.api.event import AstrMessageEvent, MessageChain, filter
 from astrbot.api.star import Context, Star, register
 
 try:
@@ -71,7 +71,10 @@ HELP_TEXT = (
     "也支持指令：\n"
     "• /日历 帮助        —— 显示本帮助\n"
     "• /日历 测试        —— 测试与 iCloud 的连接\n"
-    "• /日历 列表 [天数] —— 查看未来若干天的日程（默认 7 天）\n\n"
+    "• /日历 列表 [天数] —— 查看未来若干天的日程（默认 7 天）\n"
+    "• /日历 提醒        —— 立即查看今天的日程\n"
+    "• /日历 订阅        —— 让机器人每天定时把当天日程发到本会话\n"
+    "• /日历 退订        —— 取消每日提醒\n\n"
     "首次使用请在插件配置中填写 Apple ID 与 App 专用密码"
     "（在 appleid.apple.com → 登录与安全 → App 专用密码 生成）。"
 )
@@ -95,6 +98,8 @@ class ICloudCalendarPlugin(Star):
         self._write_calendar = None  # caldav.Calendar（新增日程的目标日历，缓存）
         self._lock = asyncio.Lock()
         self._guide = DEFAULT_GUIDE
+        self._reminder_task = None  # 每日提醒后台任务
+        self._last_reminder_date = None  # 上次发送提醒的日期（去重，每天一次）
 
     # ------------------------------------------------------------------ #
     # 生命周期
@@ -118,7 +123,14 @@ class ICloudCalendarPlugin(Star):
                 _IMPORT_ERROR,
             )
 
+        # 启动每日提醒后台任务（内部按配置决定是否真正发送）。
+        if self._reminder_task is None:
+            self._reminder_task = asyncio.create_task(self._reminder_loop())
+
     async def terminate(self) -> None:
+        if self._reminder_task is not None:
+            self._reminder_task.cancel()
+            self._reminder_task = None
         self._reset()
 
     # ------------------------------------------------------------------ #
@@ -175,6 +187,92 @@ class ICloudCalendarPlugin(Star):
             req.system_prompt = (getattr(req, "system_prompt", "") or "") + header + self._guide
         except Exception as e:  # noqa: BLE001
             logger.warning(f"[icloud_calendar] 注入引导失败：{e}")
+
+    # ------------------------------------------------------------------ #
+    # 每日定时提醒（后台任务，主动推送当天日程）
+    # ------------------------------------------------------------------ #
+    async def _reminder_loop(self) -> None:
+        """每 30 秒检查一次；到达配置时间且当天未发过，则主动推送今日日程。
+
+        采用轮询而非「算好时间一觉睡到」，是为了能即时响应配置变更（开关 / 时间 /
+        目标会话），并对事件循环偶发卡顿有 2 分钟的容错窗口。
+        """
+        logger.info("[icloud_calendar] 每日提醒任务已启动")
+        while True:
+            try:
+                await asyncio.sleep(30)
+                now = datetime.now(self._tz)
+                if self._reminder_due(now):
+                    self._last_reminder_date = now.date()
+                    session = (self.config.get("daily_reminder_session") or "").strip()
+                    await self._send_daily_reminder(session, now)
+            except asyncio.CancelledError:
+                logger.info("[icloud_calendar] 每日提醒任务已停止")
+                break
+            except Exception as e:  # noqa: BLE001 - 后台任务必须长存，吞掉单次异常
+                logger.error(f"[icloud_calendar] 每日提醒任务异常：{e}")
+
+    def _reminder_due(self, now: datetime) -> bool:
+        """是否到达今天的提醒触发条件（已启用、配了目标、当天未发、处于 2 分钟窗口内）。"""
+        if not self.config.get("daily_reminder_enabled", False):
+            return False
+        if not (self.config.get("daily_reminder_session") or "").strip():
+            return False
+        if self._last_reminder_date == now.date():
+            return False
+        hm = self._parse_hhmm(self.config.get("daily_reminder_time", "08:00"))
+        if hm is None:
+            return False
+        target = now.replace(hour=hm[0], minute=hm[1], second=0, microsecond=0)
+        # 到点后的 2 分钟窗口内触发一次，避免轮询抖动导致漏发或重复发。
+        return target <= now < target + timedelta(minutes=2)
+
+    async def _send_daily_reminder(self, session: str, now: datetime) -> None:
+        start_utc, end_utc = self._today_window()
+        try:
+            items = await self._run(self._list_sync, start_utc, end_utc)
+        except Exception as e:  # noqa: BLE001
+            logger.error(f"[icloud_calendar] 每日提醒查询日程失败：{e}")
+            return
+        text = self._format_daily(items, now)
+        try:
+            ok = await self.context.send_message(session, MessageChain().message(text))
+            if not ok:
+                logger.warning(
+                    f"[icloud_calendar] 每日提醒发送失败：未找到会话 {session} 对应的平台"
+                )
+        except Exception as e:  # noqa: BLE001
+            logger.error(f"[icloud_calendar] 每日提醒发送异常：{e}")
+
+    def _format_daily(self, items: list[dict], now: datetime) -> str:
+        weekday = "一二三四五六日"[now.weekday()]
+        date_str = now.strftime("%Y-%m-%d")
+        if not items:
+            return f"📅 今日日程提醒（{date_str} 周{weekday}）\n今天暂无日程安排，轻松一天～"
+        lines = [f"📅 今日日程提醒（{date_str} 周{weekday}），共 {len(items)} 项："]
+        lines.extend(self._format_lines(items))
+        return "\n".join(lines)
+
+    def _today_window(self):
+        """今天 00:00–次日 00:00（本地时区）转 UTC。"""
+        now = datetime.now(self._tz)
+        start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        end = start + timedelta(days=1)
+        return start.astimezone(timezone.utc), end.astimezone(timezone.utc)
+
+    @staticmethod
+    def _parse_hhmm(s: str):
+        """解析 'HH:MM'（兼容中文冒号），返回 (hh, mm)，非法返回 None。"""
+        raw = (s or "").strip().replace("：", ":")
+        try:
+            parts = raw.split(":")
+            hh = int(parts[0])
+            mm = int(parts[1]) if len(parts) > 1 else 0
+            if 0 <= hh < 24 and 0 <= mm < 60:
+                return hh, mm
+        except (ValueError, IndexError):
+            pass
+        return None
 
     # ------------------------------------------------------------------ #
     # 函数工具（供 LLM 调用，返回 str → 交给 LLM 组织回复）
@@ -369,6 +467,24 @@ class ICloudCalendarPlugin(Star):
             yield event.plain_result(HELP_TEXT)
             return
 
+        if action in ("订阅", "subscribe", "sub", "提醒订阅"):
+            self.config["daily_reminder_session"] = event.unified_msg_origin
+            self.config["daily_reminder_enabled"] = True
+            self.config.save_config()
+            tstr = (self.config.get("daily_reminder_time") or "08:00").strip()
+            yield event.plain_result(
+                "✅ 已开启每日日程提醒\n"
+                f"将在每天 {tstr} 把当天日程发送到本会话。\n"
+                "取消请发送：/日历 退订"
+            )
+            return
+
+        if action in ("退订", "unsubscribe", "unsub", "取消提醒"):
+            self.config["daily_reminder_enabled"] = False
+            self.config.save_config()
+            yield event.plain_result("✅ 已关闭每日日程提醒。")
+            return
+
         guard = self._dep_guard()
         if guard:
             yield event.plain_result(guard)
@@ -407,6 +523,17 @@ class ICloudCalendarPlugin(Star):
             lines = [f"📅 {label}的日程（{len(items)} 个）："]
             lines.extend(self._format_lines(items))
             yield event.plain_result("\n".join(lines))
+            return
+
+        if action in ("提醒", "今日", "今天", "today"):
+            now = datetime.now(self._tz)
+            start_utc, end_utc = self._today_window()
+            try:
+                items = await self._run(self._list_sync, start_utc, end_utc)
+            except Exception as e:  # noqa: BLE001
+                yield event.plain_result(self._err("查询今日日程", e))
+                return
+            yield event.plain_result(self._format_daily(items, now))
             return
 
         yield event.plain_result("未识别的子命令。\n\n" + HELP_TEXT)
