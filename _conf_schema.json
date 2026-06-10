@@ -12,10 +12,16 @@
     "default": ""
   },
   "calendar_name": {
-    "description": "目标日历名称",
+    "description": "写入日历名称",
     "type": "string",
-    "hint": "要写入/读取的日历名称；留空则使用账户下的第一个日历",
+    "hint": "新增日程写入到哪个日历；留空则使用账户下的第一个日历。查询/修改/删除默认覆盖全部日历（见 query_all_calendars）",
     "default": ""
+  },
+  "query_all_calendars": {
+    "description": "查询/搜索覆盖全部日历",
+    "type": "bool",
+    "hint": "开启后，查询、修改、删除会遍历账户下所有日历；关闭则只在「写入日历」内操作",
+    "default": true
   },
   "timezone": {
     "description": "时区（IANA 名称）",

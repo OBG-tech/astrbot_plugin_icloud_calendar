@@ -89,7 +89,8 @@ class ICloudCalendarPlugin(Star):
         super().__init__(context)
         self.config = config
         self._client = None  # caldav.DAVClient
-        self._calendar = None  # caldav.Calendar（缓存）
+        self._calendars = None  # list[caldav.Calendar]（全部日历，缓存）
+        self._write_calendar = None  # caldav.Calendar（新增日程的目标日历，缓存）
         self._lock = asyncio.Lock()
         self._guide = DEFAULT_GUIDE
 
@@ -116,8 +117,7 @@ class ICloudCalendarPlugin(Star):
             )
 
     async def terminate(self) -> None:
-        self._client = None
-        self._calendar = None
+        self._reset()
 
     # ------------------------------------------------------------------ #
     # 配置便捷读取
@@ -212,12 +212,12 @@ class ICloudCalendarPlugin(Star):
 
         ical = self._build_ical(title, start_dt, end_dt, (description or "").strip())
         try:
-            await self._run(self._add_sync, ical)
+            cal_name = await self._run(self._add_sync, ical)
         except Exception as e:  # noqa: BLE001
             return self._err("添加日程", e)
 
         lines = [
-            "已成功添加日程到 iCloud：",
+            f"已成功添加日程到 iCloud（日历：{cal_name}）：",
             f"标题：{title}",
             f"开始：{self._fmt(start_dt)}",
             f"结束：{self._fmt(end_dt)}",
@@ -255,7 +255,7 @@ class ICloudCalendarPlugin(Star):
             return f"{label}没有找到日程安排。"
 
         lines = [f"{label}共有 {len(items)} 个日程："]
-        lines.extend(self._brief(it) for it in items)
+        lines.extend(self._format_lines(items))
         return "\n".join(lines)
 
     @filter.llm_tool("icloud_update_event")
@@ -376,11 +376,17 @@ class ICloudCalendarPlugin(Star):
             except Exception as e:  # noqa: BLE001
                 yield event.plain_result(self._err("连接 iCloud", e))
                 return
-            yield event.plain_result(
-                "✅ 已连接 iCloud\n"
-                f"日历：{info['name']}\n"
-                f"未来 7 天日程数：{info['count']}"
-            )
+            scope = "全部日历" if self.config.get("query_all_calendars", True) else "写入日历"
+            lines = [
+                "✅ 已连接 iCloud",
+                f"写入日历：{info['write']}",
+                f"查询范围：{scope}（共 {len(info['calendars'])} 个日历）",
+                "未来 7 天各日历日程数：",
+            ]
+            for c in info["calendars"]:
+                cnt = "读取失败" if c["count"] < 0 else f"{c['count']} 个"
+                lines.append(f"• {c['name']}：{cnt}")
+            yield event.plain_result("\n".join(lines))
             return
 
         if action in ("列表", "查询", "list", "ls"):
@@ -395,7 +401,7 @@ class ICloudCalendarPlugin(Star):
                 yield event.plain_result(f"📅 {label}没有日程。")
                 return
             lines = [f"📅 {label}的日程（{len(items)} 个）："]
-            lines.extend(self._brief(it) for it in items)
+            lines.extend(self._format_lines(items))
             yield event.plain_result("\n".join(lines))
             return
 
@@ -410,22 +416,24 @@ class ICloudCalendarPlugin(Star):
 
     def _call_with_retry(self, fn, *args):
         try:
-            cal = self._ensure_calendar()
-            return fn(cal, *args)
+            return fn(*args)
         except RuntimeError:
             # 配置类错误（未填账号、找不到日历等），无需重试。
             raise
         except Exception as e:  # noqa: BLE001 - 可能是连接/会话过期，重连重试一次
             logger.warning(f"[icloud_calendar] 操作失败，重连后重试一次：{e}")
-            self._client = None
-            self._calendar = None
-            cal = self._ensure_calendar()
-            return fn(cal, *args)
+            self._reset()
+            return fn(*args)
 
-    def _ensure_calendar(self):
-        """（同步）确保已连接并返回目标日历对象，结果缓存在实例上。"""
-        if self._calendar is not None:
-            return self._calendar
+    def _reset(self) -> None:
+        self._client = None
+        self._calendars = None
+        self._write_calendar = None
+
+    def _ensure_calendars(self):
+        """（同步）确保已连接并返回账户下的全部日历，结果缓存在实例上。"""
+        if self._calendars is not None:
+            return self._calendars
 
         username = (self.config.get("username") or "").strip()
         password = (self.config.get("password") or "").strip()
@@ -441,16 +449,23 @@ class ICloudCalendarPlugin(Star):
         if not calendars:
             raise RuntimeError("该 iCloud 账户下没有找到任何日历。")
 
-        target = None
+        self._client = client
+        self._calendars = list(calendars)
+        return self._calendars
+
+    def _ensure_write_calendar(self):
+        """（同步）返回新增日程的目标日历：优先配置的名称，否则第一个。"""
+        if self._write_calendar is not None:
+            return self._write_calendar
+
+        calendars = self._ensure_calendars()
         name = (self.config.get("calendar_name") or "").strip()
         if name:
+            target = None
             for c in calendars:
-                try:
-                    if (c.name or "") == name:
-                        target = c
-                        break
-                except Exception:  # noqa: BLE001
-                    continue
+                if (self._safe_name(c) or "") == name:
+                    target = c
+                    break
             if target is None:
                 available = ", ".join(self._safe_names(calendars))
                 raise RuntimeError(
@@ -459,51 +474,87 @@ class ICloudCalendarPlugin(Star):
         else:
             target = calendars[0]
 
-        self._client = client
-        self._calendar = target
+        self._write_calendar = target
         return target
+
+    def _query_calendars(self):
+        """（同步）查询/搜索时要遍历的日历：默认全部，可在配置中限定为写入日历。"""
+        if self.config.get("query_all_calendars", True):
+            return self._ensure_calendars()
+        return [self._ensure_write_calendar()]
 
     # ================================================================== #
     # 内部：同步 CalDAV 操作（运行于线程池）
     # ================================================================== #
-    def _add_sync(self, cal, ical_text: str):
+    def _add_sync(self, ical_text: str):
+        cal = self._ensure_write_calendar()
         cal.add_event(ical_text)
-        return True
+        return self._safe_name(cal) or "（默认）"
 
-    def _list_sync(self, cal, start_utc: datetime, end_utc: datetime):
-        results = cal.search(start=start_utc, end=end_utc, event=True, expand=True)
+    def _list_sync(self, start_utc: datetime, end_utc: datetime):
         items = []
-        for r in results:
-            for comp in self._iter_vevents(r):
-                info = self._extract(comp)
-                if info:
-                    items.append(info)
+        last_err = None
+        got_any = False
+        for cal in self._query_calendars():
+            cal_name = self._safe_name(cal)
+            try:
+                results = cal.search(
+                    start=start_utc, end=end_utc, event=True, expand=True
+                )
+                got_any = True
+            except Exception as e:  # noqa: BLE001 - 单个日历失败不影响其它日历
+                last_err = e
+                logger.warning(f"[icloud_calendar] 查询日历「{cal_name}」失败：{e}")
+                continue
+            for r in results:
+                for comp in self._iter_vevents(r):
+                    info = self._extract(comp)
+                    if info:
+                        info["calendar"] = cal_name
+                        items.append(info)
+        if not got_any and last_err is not None:
+            raise last_err
         items.sort(key=lambda x: x["sort"])
         return items[: self._max_results]
 
-    def _search_matches(self, cal, keyword: str, start_utc: datetime, end_utc: datetime):
-        """返回 [(resource, info), ...]，按开始时间排序，未展开（便于删除/重建）。"""
-        results = cal.search(start=start_utc, end=end_utc, event=True, expand=False)
+    def _search_matches(self, keyword: str, start_utc: datetime, end_utc: datetime):
+        """跨所有（查询）日历搜索，返回 [(resource, info), ...]，未展开（便于删除/重建）。"""
         kw = keyword.strip().lower()
         matches = []
-        for r in results:
+        last_err = None
+        got_any = False
+        for cal in self._query_calendars():
+            cal_name = self._safe_name(cal)
             try:
-                comp = r.icalendar_component
-            except Exception:  # noqa: BLE001
+                results = cal.search(
+                    start=start_utc, end=end_utc, event=True, expand=False
+                )
+                got_any = True
+            except Exception as e:  # noqa: BLE001
+                last_err = e
+                logger.warning(f"[icloud_calendar] 搜索日历「{cal_name}」失败：{e}")
                 continue
-            if comp is None:
-                continue
-            summary = str(comp.get("summary", "") or "")
-            if kw and kw not in summary.lower():
-                continue
-            info = self._extract(comp)
-            if info:
-                matches.append((r, info))
+            for r in results:
+                try:
+                    comp = r.icalendar_component
+                except Exception:  # noqa: BLE001
+                    continue
+                if comp is None:
+                    continue
+                summary = str(comp.get("summary", "") or "")
+                if kw and kw not in summary.lower():
+                    continue
+                info = self._extract(comp)
+                if info:
+                    info["calendar"] = cal_name
+                    matches.append((r, info))
+        if not got_any and last_err is not None:
+            raise last_err
         matches.sort(key=lambda x: x[1]["sort"])
         return matches[: self._max_results]
 
-    def _search_and_update_sync(self, cal, keyword, start_utc, end_utc, overrides):
-        matches = self._search_matches(cal, keyword, start_utc, end_utc)
+    def _search_and_update_sync(self, keyword, start_utc, end_utc, overrides):
+        matches = self._search_matches(keyword, start_utc, end_utc)
         if not matches:
             return "none", None
         if len(matches) > 1:
@@ -532,13 +583,15 @@ class ICloudCalendarPlugin(Star):
             end = start + timedelta(minutes=self._default_duration)
 
         ical = self._build_ical(title, start, end, info.get("description", ""))
+        # 在原事件所属日历里重建，避免修改时把事件挪到别的日历。
+        target_cal = getattr(resource, "parent", None) or self._ensure_write_calendar()
         # 先新增、再删除旧的：即使中途出错也不会丢数据（最多产生一条重复）。
-        cal.add_event(ical)
+        target_cal.add_event(ical)
         resource.delete()
         return "ok", {"title": title, "start": start, "end": end}
 
-    def _search_and_delete_sync(self, cal, keyword, start_utc, end_utc):
-        matches = self._search_matches(cal, keyword, start_utc, end_utc)
+    def _search_and_delete_sync(self, keyword, start_utc, end_utc):
+        matches = self._search_matches(keyword, start_utc, end_utc)
         if not matches:
             return "none", None
         if len(matches) > 1:
@@ -547,12 +600,22 @@ class ICloudCalendarPlugin(Star):
         resource.delete()
         return "ok", info
 
-    def _status_sync(self, cal):
+    def _status_sync(self):
         now = datetime.now(timezone.utc)
-        results = cal.search(
-            start=now, end=now + timedelta(days=7), event=True, expand=True
-        )
-        return {"name": (self._safe_name(cal) or "（默认）"), "count": len(results)}
+        end = now + timedelta(days=7)
+        write_name = self._safe_name(self._ensure_write_calendar()) or "（默认）"
+        cals = []
+        for cal in self._ensure_calendars():
+            name = self._safe_name(cal) or "（未命名）"
+            try:
+                count = len(
+                    cal.search(start=now, end=end, event=True, expand=True)
+                )
+            except Exception as e:  # noqa: BLE001
+                logger.warning(f"[icloud_calendar] 统计日历「{name}」失败：{e}")
+                count = -1
+            cals.append({"name": name, "count": count})
+        return {"write": write_name, "calendars": cals}
 
     # ================================================================== #
     # 内部：iCal 构造 / 解析 / 格式化
@@ -633,7 +696,7 @@ class ICloudCalendarPlugin(Star):
             return value.strftime(f"%Y-%m-%d（周{weekday}）全天")
         return "（时间未知）"
 
-    def _brief(self, info: dict) -> str:
+    def _brief(self, info: dict, show_calendar: bool = False) -> str:
         start = info["start"]
         if isinstance(start, datetime):
             s = self._to_local(start)
@@ -642,7 +705,16 @@ class ICloudCalendarPlugin(Star):
             ts = start.strftime("%m-%d 全天")
         else:
             ts = "时间未知"
-        return f"• {ts}  {info['summary']}"
+        line = f"• {ts}  {info['summary']}"
+        if show_calendar and info.get("calendar"):
+            line += f"  [{info['calendar']}]"
+        return line
+
+    def _format_lines(self, items: list[dict]) -> list[str]:
+        """格式化日程列表；当结果跨越多个日历时，额外标注每条所属日历。"""
+        distinct = {it.get("calendar") for it in items if it.get("calendar")}
+        show_calendar = len(distinct) > 1
+        return [self._brief(it, show_calendar) for it in items]
 
     # ================================================================== #
     # 内部：时间解析与查询窗口
@@ -754,7 +826,7 @@ class ICloudCalendarPlugin(Star):
 
     def _many(self, keyword: str, infos: list[dict]) -> str:
         lines = [f"找到多个包含「{keyword}」的日程，请告诉我是哪一个（可补充日期）："]
-        lines.extend(self._brief(it) for it in infos)
+        lines.extend(self._format_lines(infos))
         return "\n".join(lines)
 
     @staticmethod
