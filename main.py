@@ -60,7 +60,9 @@ DEFAULT_GUIDE = (
     "2. 调用前先把相对时间换算成绝对时间，格式 YYYY-MM-DDTHH:MM:SS（24 小时制）。"
     "“下午/晚上 3 点”=15:00:00；未给结束时间则不填 end；只有日期没有时间则按 09:00:00。\n"
     "3. search_title 用关键词即可（模糊匹配）；修改/删除时尽量带上 search_date（YYYY-MM-DD）缩小范围。\n"
-    "4. 工具返回结果后，用简洁中文转述给用户：新增用 ✅、删除用 🗑️、失败如实说明原因，不要编造结果。"
+    "4. 添加日程时，若用户明确指定了要写入的日历（如“加到工作日历”“记到家庭日历”），"
+    "把日历名填入 calendar 参数；用户没说则不填（写入默认日历）。\n"
+    "5. 工具返回结果后，用简洁中文转述给用户：新增用 ✅、删除用 🗑️、失败如实说明原因，不要编造结果。"
 )
 
 HELP_TEXT = (
@@ -185,6 +187,7 @@ class ICloudCalendarPlugin(Star):
         start: str = "",
         end: str = "",
         description: str = "",
+        calendar: str = "",
     ) -> str:
         """在 iCloud 日历中添加一个新日程/事件。当用户想记录、安排、预约某个带时间的事项时调用。
 
@@ -193,6 +196,7 @@ class ICloudCalendarPlugin(Star):
             start(string): 开始时间，本地时区，格式 YYYY-MM-DDTHH:MM:SS（24 小时制），例如 2026-06-11T15:00:00。必填。
             end(string): 结束时间，格式同 start。可选；不填则默认开始时间后一段时间（见插件配置）。
             description(string): 备注 / 详情，可选。
+            calendar(string): 要写入的目标日历名称，例如“工作”“家庭”。可选；仅当用户明确指定写到某个日历时才填，不填则写入默认日历。
         """
         guard = self._dep_guard()
         if guard:
@@ -212,7 +216,7 @@ class ICloudCalendarPlugin(Star):
 
         ical = self._build_ical(title, start_dt, end_dt, (description or "").strip())
         try:
-            cal_name = await self._run(self._add_sync, ical)
+            cal_name = await self._run(self._add_sync, ical, (calendar or "").strip())
         except Exception as e:  # noqa: BLE001
             return self._err("添加日程", e)
 
@@ -486,10 +490,39 @@ class ICloudCalendarPlugin(Star):
     # ================================================================== #
     # 内部：同步 CalDAV 操作（运行于线程池）
     # ================================================================== #
-    def _add_sync(self, ical_text: str):
-        cal = self._ensure_write_calendar()
+    def _add_sync(self, ical_text: str, calendar_name: str = ""):
+        cal = self._pick_calendar(calendar_name)
         cal.add_event(ical_text)
         return self._safe_name(cal) or "（默认）"
+
+    def _pick_calendar(self, name: str):
+        """选择写入日历：指定了名称就按名称匹配，否则用默认写入日历。"""
+        requested = (name or "").strip()
+        if not requested:
+            return self._ensure_write_calendar()
+        cal = self._resolve_calendar_by_name(requested)
+        if cal is None:
+            available = ", ".join(self._safe_names(self._ensure_calendars()))
+            raise RuntimeError(
+                f"未找到名为「{requested}」的日历。可用日历：{available or '（无法获取名称）'}"
+            )
+        return cal
+
+    def _resolve_calendar_by_name(self, name: str):
+        """按名称匹配日历：先精确，再模糊（互为子串），找不到返回 None。"""
+        target = (name or "").strip()
+        if not target:
+            return None
+        calendars = self._ensure_calendars()
+        for c in calendars:  # 精确匹配优先
+            if (self._safe_name(c) or "") == target:
+                return c
+        low = target.lower()
+        for c in calendars:  # 模糊匹配：互为子串（“工作” ↔ “工作日历”）
+            cn = (self._safe_name(c) or "").lower()
+            if cn and (low in cn or cn in low):
+                return c
+        return None
 
     def _list_sync(self, start_utc: datetime, end_utc: datetime):
         items = []
