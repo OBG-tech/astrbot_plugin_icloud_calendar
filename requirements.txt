@@ -1,0 +1,6 @@
+# iCloud 通过 CalDAV 协议访问
+caldav>=1.3.0
+# 构造 / 解析 iCalendar (VEVENT)
+icalendar>=5.0.0
+# 提供 IANA 时区数据库（Windows 以及精简版 Linux 的 zoneinfo 依赖它）
+tzdata>=2024.1

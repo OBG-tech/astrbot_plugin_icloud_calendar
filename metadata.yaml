@@ -1,0 +1,5 @@
+name: astrbot_plugin_icloud_calendar
+desc: 通过自然语言或指令读取、添加、修改、删除 iCloud 日历（基于 CalDAV）
+version: 2.0.0
+author: Yufu_Lv
+repo: https://github.com/Yufu-Lv/astrbot_plugin_icloud_calendar

@@ -1,0 +1,56 @@
+{
+  "username": {
+    "description": "Apple ID（iCloud 邮箱）",
+    "type": "string",
+    "hint": "你的 Apple ID，例如 you@icloud.com",
+    "default": ""
+  },
+  "password": {
+    "description": "App 专用密码",
+    "type": "string",
+    "hint": "在 appleid.apple.com → 登录与安全 → App 专用密码 生成，不是 Apple ID 登录密码",
+    "default": ""
+  },
+  "calendar_name": {
+    "description": "目标日历名称",
+    "type": "string",
+    "hint": "要写入/读取的日历名称；留空则使用账户下的第一个日历",
+    "default": ""
+  },
+  "timezone": {
+    "description": "时区（IANA 名称）",
+    "type": "string",
+    "hint": "用于解析与显示时间，例如 Asia/Shanghai、Asia/Tokyo",
+    "default": "Asia/Shanghai"
+  },
+  "caldav_url": {
+    "description": "CalDAV 服务器地址",
+    "type": "string",
+    "hint": "iCloud 默认即可；中国大陆账户如连接异常可尝试 https://caldav.icloud.com.cn/",
+    "default": "https://caldav.icloud.com/"
+  },
+  "default_duration_minutes": {
+    "description": "默认时长（分钟）",
+    "type": "int",
+    "hint": "添加日程时若未给出结束时间，默认持续多久",
+    "default": 60
+  },
+  "list_default_days": {
+    "description": "查询默认天数",
+    "type": "int",
+    "hint": "未指定范围时，查询从现在起未来多少天的日程",
+    "default": 7
+  },
+  "max_results": {
+    "description": "返回的最大日程条数",
+    "type": "int",
+    "hint": "查询/搜索时一次最多返回多少条，避免刷屏",
+    "default": 20
+  },
+  "inject_guidance": {
+    "description": "自动注入日历助手引导词",
+    "type": "bool",
+    "hint": "开启后会在每次对话中注入「当前时间 + 工具使用引导」，让大模型主动识别日程意图并换算相对时间。关闭后建议改用人格(persona)加载 SKILL.md",
+    "default": true
+  }
+}
