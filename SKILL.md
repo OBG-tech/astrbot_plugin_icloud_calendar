@@ -1,6 +1,6 @@
 ---
 name: icloud-calendar
-description: 当用户提到任何日程、安排、计划、会议、提醒、行程等话题时，必须激活本 skill。使用 icloud_add_event / icloud_list_events / icloud_update_event / icloud_delete_event 工具操作 iCloud 日历。不要等待用户明确说"加到日历"，只要出现时间+事项的组合就应主动调用工具。
+description: 当用户提到任何日程、安排、计划、会议、提醒、行程或日历名称时，必须激活本 skill。使用 icloud_add_event / icloud_list_events / icloud_list_calendars / icloud_update_event / icloud_delete_event 工具操作 iCloud 日历。不要等待用户明确说"加到日历"，只要出现时间+事项的组合就应主动调用工具。
 ---
 
 # iCloud 日历助手
@@ -14,6 +14,8 @@ description: 当用户提到任何日程、安排、计划、会议、提醒、�
 3. 用户问「我有什么安排」「这周行程」「日程」「计划」等查询类话题
 4. 用户说「改」「推迟」「提前」「延期」+ 某个日程
 5. 用户说「删」「取消」「不去了」+ 某个日程
+6. 用户询问「有哪些日历」「列出所有日历」「可用日历」或某个日历名称
+
 
 ## 可用工具
 
@@ -21,6 +23,7 @@ description: 当用户提到任何日程、安排、计划、会议、提醒、�
 |------|------|----------|
 | `icloud_add_event` | 添加日程 | title, start, end, description, calendar |
 | `icloud_list_events` | 查询日程 | days（查未来几天，默认 "7"） |
+| `icloud_list_calendars` | 列出所有日历 | 无 |
 | `icloud_update_event` | 修改日程 | search_title, search_date, new_title, new_start, new_end |
 | `icloud_delete_event` | 删除日程 | search_title, search_date |
 
@@ -36,6 +39,8 @@ description: 当用户提到任何日程、安排、计划、会议、提醒、�
 3. **模糊匹配搜索** —— `search_title` 只需填关键词，不需要完整标题。
 4. **宽松容错** —— 时间不完整时使用默认值，而不是拒绝执行。
 5. **按需指定日历** —— 添加日程时，只有当用户**明确说**要写到某个日历（如“加到工作日历”）才填 `calendar` 参数；没说就**留空**，由插件写入默认日历。
+6. **先获取日历名称** —— 用户询问有哪些日历时调用 `icloud_list_calendars`，不要猜测或编造日历名称；添加日程时若用户指定的名称不明确，可先列出日历再匹配。
+
 
 ### ❌ 禁止做法
 
@@ -64,6 +69,7 @@ description: 当用户提到任何日程、安排、计划、会议、提醒、�
 |----------|-----------|----------|
 | 添加 | 加、记、安排、约、提醒 | `icloud_add_event` |
 | 查询 | 有什么、安排、行程、查、看看 | `icloud_list_events` |
+| 日历目录 | 有哪些日历、可用日历、列出日历 | `icloud_list_calendars` |
 | 修改 | 改、推、延、挪、换时间 | `icloud_update_event` |
 | 删除 | 删、取消、不去了、去掉 | `icloud_delete_event` |
 
@@ -80,6 +86,10 @@ description: 当用户提到任何日程、安排、计划、会议、提醒、�
 
 **用户**：「这周有什么安排？」
 → 调用 `icloud_list_events`，days="7"
+
+**用户**：「我有哪些日历？」
+→ 调用 `icloud_list_calendars`
+
 
 **用户**：「把周五的会议推到下周一同一时间」
 → 调用 `icloud_update_event`，search_title="会议"，search_date="<周五日期>"，new_start="<下周一>T<原时间>"

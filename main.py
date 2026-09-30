@@ -2,7 +2,7 @@
 
 设计要点
 --------
-1. 4 个 ``@filter.llm_tool`` 函数工具（add / list / update / delete），
+1. 5 个 ``@filter.llm_tool`` 函数工具（add / list events / list calendars / update / delete），
    大模型在对话中识别到日程意图时会自动调用，无需用户输入 ``/`` 命令。
    工具均为协程并 ``return str``：返回值会被 AstrBot 喂回给 LLM，
    由 LLM 按 SKILL.md 的格式组织最终回复（这是框架推荐用法）。
@@ -52,17 +52,19 @@ DEFAULT_GUIDE = (
     "你已接入用户的 iCloud 日历，可使用以下函数工具进行操作（无需用户输入命令前缀）：\n"
     "- icloud_add_event：添加日程\n"
     "- icloud_list_events：查询日程\n"
+    "- icloud_list_calendars：列出账户下所有日历\n"
     "- icloud_update_event：修改日程（改时间 / 改标题）\n"
     "- icloud_delete_event：删除 / 取消日程\n\n"
     "调用规则：\n"
     "1. 当用户消息出现「时间 + 事项」（如“明天下午3点开会”），或出现查询/修改/删除日程的意图时，"
     "主动调用对应工具，不要反复追问“你确定吗”。\n"
-    "2. 调用前先把相对时间换算成绝对时间，格式 YYYY-MM-DDTHH:MM:SS（24 小时制）。"
+    "2. 当用户询问有哪些日历、日历名称或可用日历时，调用 icloud_list_calendars。\n"
+    "3. 调用前先把相对时间换算成绝对时间，格式 YYYY-MM-DDTHH:MM:SS（24 小时制）。"
     "“下午/晚上 3 点”=15:00:00；未给结束时间则不填 end；只有日期没有时间则按 09:00:00。\n"
-    "3. search_title 用关键词即可（模糊匹配）；修改/删除时尽量带上 search_date（YYYY-MM-DD）缩小范围。\n"
-    "4. 添加日程时，若用户明确指定了要写入的日历（如“加到工作日历”“记到家庭日历”），"
+    "4. search_title 用关键词即可（模糊匹配）；修改/删除时尽量带上 search_date（YYYY-MM-DD）缩小范围。\n"
+    "5. 添加日程时，若用户明确指定了要写入的日历（如“加到工作日历”“记到家庭日历”），"
     "把日历名填入 calendar 参数；用户没说则不填（写入默认日历）。\n"
-    "5. 工具返回结果后，用简洁中文转述给用户：新增用 ✅、删除用 🗑️、失败如实说明原因，不要编造结果。"
+    "6. 工具返回结果后，用简洁中文转述给用户：新增用 ✅、删除用 🗑️、失败如实说明原因，不要编造结果。"
 )
 
 HELP_TEXT = (
@@ -71,6 +73,7 @@ HELP_TEXT = (
     "也支持指令：\n"
     "• /日历 帮助        —— 显示本帮助\n"
     "• /日历 测试        —— 测试与 iCloud 的连接\n"
+    "• /日历 日历列表    —— 列出账户下所有日历\n"
     "• /日历 列表 [天数] —— 查看未来若干天的日程（默认 7 天）\n"
     "• /日历 提醒        —— 立即查看今天的日程\n"
     "• /日历 订阅        —— 让机器人每天定时把当天日程发到本会话\n"
@@ -94,8 +97,8 @@ class ICloudCalendarPlugin(Star):
         super().__init__(context)
         self.config = config
         self._client = None  # caldav.DAVClient
-        self._calendars = None  # list[caldav.Calendar]（全部日历，缓存）
-        self._write_calendar = None  # caldav.Calendar（新增日程的目标日历，缓存）
+        self._calendars = None  # list[caldav.Calendar]（当前操作的日历缓存）
+        self._write_calendar = None  # caldav.Calendar（当前操作的写入日历缓存）
         self._lock = asyncio.Lock()
         self._guide = DEFAULT_GUIDE
         self._reminder_task = None  # 每日提醒后台任务
@@ -359,6 +362,19 @@ class ICloudCalendarPlugin(Star):
         lines = [f"{label}共有 {len(items)} 个日程："]
         lines.extend(self._format_lines(items))
         return "\n".join(lines)
+    @filter.llm_tool("icloud_list_calendars")
+    async def icloud_list_calendars(self, event: AstrMessageEvent) -> str:
+        """列出当前 iCloud 账户下的全部日历名称。用户询问有哪些日历、日历名称或可用日历时调用。"""
+        guard = self._dep_guard()
+        if guard:
+            return guard
+
+        try:
+            info = await self._run(self._list_calendars_sync)
+        except Exception as e:  # noqa: BLE001
+            return self._err("列出日历", e)
+        return self._format_calendar_list(info)
+
 
     @filter.llm_tool("icloud_update_event")
     async def icloud_update_event(
@@ -490,6 +506,15 @@ class ICloudCalendarPlugin(Star):
             yield event.plain_result(guard)
             return
 
+        if action in ("日历", "日历列表", "calendars", "calendarlist"):
+            try:
+                info = await self._run(self._list_calendars_sync)
+            except Exception as e:  # noqa: BLE001
+                yield event.plain_result(self._err("列出日历", e))
+                return
+            yield event.plain_result(self._format_calendar_list(info))
+            return
+
         if action in ("测试", "test", "status", "状态"):
             try:
                 info = await self._run(self._status_sync)
@@ -508,6 +533,7 @@ class ICloudCalendarPlugin(Star):
                 lines.append(f"• {c['name']}：{cnt}")
             yield event.plain_result("\n".join(lines))
             return
+
 
         if action in ("列表", "查询", "list", "ls"):
             days = arg.strip() if (arg or "").strip().isdigit() else str(self._default_days)
@@ -547,6 +573,9 @@ class ICloudCalendarPlugin(Star):
 
     def _call_with_retry(self, fn, *args):
         try:
+            # 日历目录可能在 iCloud 网页端或其它设备上发生变化；每个
+            # 顶层操作开始前都重新发现，避免长期复用过期的目录缓存。
+            self._refresh_calendars()
             return fn(*args)
         except RuntimeError:
             # 配置类错误（未填账号、找不到日历等），无需重试。
@@ -554,6 +583,7 @@ class ICloudCalendarPlugin(Star):
         except Exception as e:  # noqa: BLE001 - 可能是连接/会话过期，重连重试一次
             logger.warning(f"[icloud_calendar] 操作失败，重连后重试一次：{e}")
             self._reset()
+            self._refresh_calendars()
             return fn(*args)
 
     def _reset(self) -> None:
@@ -561,8 +591,13 @@ class ICloudCalendarPlugin(Star):
         self._calendars = None
         self._write_calendar = None
 
+    def _refresh_calendars(self):
+        """（同步）强制重新发现日历，并更新本次操作使用的缓存。"""
+        self._reset()
+        return self._ensure_calendars()
+
     def _ensure_calendars(self):
-        """（同步）确保已连接并返回账户下的全部日历，结果缓存在实例上。"""
+        """（同步）确保已连接并返回当前操作的全部日历。"""
         if self._calendars is not None:
             return self._calendars
 
@@ -598,6 +633,13 @@ class ICloudCalendarPlugin(Star):
                     target = c
                     break
             if target is None:
+                # 处理 iCloud 在目录更新后短暂延迟的情况：强制重新发现一次。
+                calendars = self._refresh_calendars()
+                for c in calendars:
+                    if (self._safe_name(c) or "") == name:
+                        target = c
+                        break
+            if target is None:
                 available = ", ".join(self._safe_names(calendars))
                 raise RuntimeError(
                     f"未找到名为「{name}」的日历。可用日历：{available or '（无法获取名称）'}"
@@ -628,6 +670,10 @@ class ICloudCalendarPlugin(Star):
         if not requested:
             return self._ensure_write_calendar()
         cal = self._resolve_calendar_by_name(requested)
+        if cal is None:
+            # 处理目录刚更新但本次操作开始时尚未同步到 CalDAV 的情况。
+            self._refresh_calendars()
+            cal = self._resolve_calendar_by_name(requested)
         if cal is None:
             available = ", ".join(self._safe_names(self._ensure_calendars()))
             raise RuntimeError(
@@ -759,6 +805,35 @@ class ICloudCalendarPlugin(Star):
         resource, info = matches[0]
         resource.delete()
         return "ok", info
+
+    def _list_calendars_sync(self):
+        """（同步）返回当前账户的日历名称和写入日历信息。"""
+        calendars = self._ensure_calendars()
+        names = [self._safe_name(cal) or "（未命名）" for cal in calendars]
+        configured = (self.config.get("calendar_name") or "").strip()
+        if configured:
+            write_name = configured if configured in names else None
+        else:
+            write_name = names[0] if names else None
+        return {
+            "names": names,
+            "write": write_name,
+            "configured": configured,
+        }
+
+    @staticmethod
+    def _format_calendar_list(info) -> str:
+        names = info["names"]
+        if not names:
+            return "iCloud 账户下没有找到日历。"
+        lines = [f"iCloud 账户共有 {len(names)} 个日历："]
+        for name in names:
+            marker = "（当前写入日历）" if name == info.get("write") else ""
+            lines.append(f"• {name}{marker}")
+        configured = info.get("configured")
+        if configured and info.get("write") is None:
+            lines.append(f"⚠️ 配置的写入日历「{configured}」当前未找到。")
+        return "\n".join(lines)
 
     def _status_sync(self):
         now = datetime.now(timezone.utc)
