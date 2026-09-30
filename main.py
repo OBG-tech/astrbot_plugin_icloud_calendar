@@ -180,9 +180,10 @@ class ICloudCalendarPlugin(Star):
         if not self.config.get("inject_guidance", True):
             return
         try:
-            now = datetime.now(self._tz)
+            tz = self._tz
+            now = datetime.now(tz)
             weekday = "一二三四五六日"[now.weekday()]
-            tz_name = (self.config.get("timezone") or "Asia/Shanghai").strip()
+            tz_name = getattr(tz, "key", None) or tz.tzname(None) or "UTC"
             header = (
                 f"\n\n[日历助手] 当前时间：{now.strftime('%Y-%m-%d %H:%M')}"
                 f"（星期{weekday}，时区 {tz_name}）。\n"
@@ -190,6 +191,7 @@ class ICloudCalendarPlugin(Star):
             req.system_prompt = (getattr(req, "system_prompt", "") or "") + header + self._guide
         except Exception as e:  # noqa: BLE001
             logger.warning(f"[icloud_calendar] 注入引导失败：{e}")
+
 
     # ------------------------------------------------------------------ #
     # 每日定时提醒（后台任务，主动推送当天日程）
@@ -522,8 +524,11 @@ class ICloudCalendarPlugin(Star):
                 yield event.plain_result(self._err("连接 iCloud", e))
                 return
             scope = "全部日历" if self.config.get("query_all_calendars", True) else "写入日历"
+            tz = self._tz
+            tz_name = getattr(tz, "key", None) or tz.tzname(None) or "UTC"
             lines = [
                 "✅ 已连接 iCloud",
+                f"插件时区：{tz_name}",
                 f"写入日历：{info['write']}",
                 f"查询范围：{scope}（共 {len(info['calendars'])} 个日历）",
                 "未来 7 天各日历日程数：",
@@ -893,8 +898,16 @@ class ICloudCalendarPlugin(Star):
             summary = str(comp.get("summary", "") or "（无标题）")
             dtstart = comp.get("dtstart")
             dtend = comp.get("dtend")
-            start = self._to_local(dtstart.dt) if dtstart is not None else None
-            end = self._to_local(dtend.dt) if dtend is not None else None
+            start = (
+                self._to_local(dtstart.dt, self._property_tzid(dtstart))
+                if dtstart is not None
+                else None
+            )
+            end = (
+                self._to_local(dtend.dt, self._property_tzid(dtend))
+                if dtend is not None
+                else None
+            )
             desc = comp.get("description")
             return {
                 "summary": summary,
@@ -907,10 +920,30 @@ class ICloudCalendarPlugin(Star):
             logger.debug(f"[icloud_calendar] 解析事件失败：{e}")
             return None
 
-    def _to_local(self, value):
+    @staticmethod
+    def _property_tzid(prop) -> str | None:
+        """读取 DTSTART/DTEND 的 TZID 参数；缺失表示浮动时间。"""
+        try:
+            value = prop.params.get("TZID")
+            return str(value).strip() if value else None
+        except Exception:  # noqa: BLE001
+            return None
+
+    def _to_local(self, value, source_tzid: str | None = None):
         if isinstance(value, datetime):
             if value.tzinfo is None:
-                value = value.replace(tzinfo=timezone.utc)
+                # 无 Z/TZID 的 iCalendar 时间是 floating time；插件用配置时区解释，
+                # 而不是错误地当作 UTC 再加一次本地偏移。
+                source_tz = self._tz
+                if source_tzid and ZoneInfo is not None:
+                    try:
+                        source_tz = ZoneInfo(source_tzid)
+                    except Exception:  # noqa: BLE001
+                        logger.warning(
+                            f"[icloud_calendar] 无法识别事件时区 {source_tzid!r}，"
+                            "按配置时区解释"
+                        )
+                value = value.replace(tzinfo=source_tz)
             return value.astimezone(self._tz)
         return value  # date（全天）
 
