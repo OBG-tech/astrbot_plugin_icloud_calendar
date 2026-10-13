@@ -303,7 +303,13 @@ class ICloudCalendarPlugin(Star):
         except Exception as e:  # noqa: BLE001
             logger.error(f"[icloud_calendar] 每日提醒查询日程失败：{e}")
             return
-        text = self._format_daily(items, now)
+        # 优先交给 LLM 按会话人格组织文案；不可用（未开开关 / 无提供商 /
+        # 调用失败）时回退到固定模板，保证提醒不丢。
+        text = None
+        if self.config.get("daily_reminder_use_llm", True):
+            text = await self._compose_daily_with_llm(session, items, now)
+        if not text:
+            text = self._format_daily(items, now)
         try:
             ok = await self.context.send_message(session, MessageChain().message(text))
             if not ok:
@@ -312,6 +318,90 @@ class ICloudCalendarPlugin(Star):
                 )
         except Exception as e:  # noqa: BLE001
             logger.error(f"[icloud_calendar] 每日提醒发送异常：{e}")
+
+    async def _compose_daily_with_llm(
+        self, session: str, items: list[dict], now: datetime
+    ) -> str | None:
+        """用当前会话的 LLM + 人格生成每日播报文案；失败返回 None（走固定模板）。"""
+        try:
+            getter = getattr(self.context, "get_using_provider_async", None)
+            provider = (
+                await getter(umo=session)
+                if getter
+                else self.context.get_using_provider(umo=session)
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"[icloud_calendar] 每日提醒获取 LLM 提供商失败：{e}")
+            return None
+        if provider is None:
+            logger.warning("[icloud_calendar] 每日提醒：未配置 LLM 提供商，使用固定模板")
+            return None
+
+        weekday = "一二三四五六日"[now.weekday()]
+        date_str = now.strftime("%Y-%m-%d")
+        if items:
+            schedule = "\n".join(self._format_lines(items))
+            data = f"今天（{date_str} 周{weekday}）共有 {len(items)} 项日程：\n{schedule}"
+        else:
+            data = f"今天（{date_str} 周{weekday}）没有任何日程安排。"
+        prompt = (
+            "现在是早晨定时播报时间。请根据下面的日程数据，以你的人格和说话风格，"
+            "给用户写一条简短的「今日日程播报」消息，就像你主动跟用户打招呼一样。\n"
+            "要求：\n"
+            "1. 保留每条日程的时间和标题，不得遗漏、不得编造；\n"
+            "2. 直接输出播报内容本身，不要解释、不要加引号；\n"
+            "3. 语气自然，可以适当加一两句关心或提醒。\n\n"
+            f"{data}"
+        )
+        system_prompt = await self._resolve_persona_prompt(session)
+        try:
+            resp = await provider.text_chat(prompt=prompt, system_prompt=system_prompt)
+            text = (getattr(resp, "completion_text", None) or "").strip()
+            if text:
+                return text
+            logger.warning("[icloud_calendar] 每日提醒 LLM 返回为空，使用固定模板")
+        except Exception as e:  # noqa: BLE001
+            logger.error(f"[icloud_calendar] 每日提醒 LLM 生成失败：{e}")
+        return None
+
+    async def _resolve_persona_prompt(self, umo: str) -> str | None:
+        """尽力解析该会话当前生效的人格 system prompt；失败返回 None（无人格直出）。
+
+        兼容新旧 AstrBot：优先用新 API resolve_selected_persona（含会话强制
+        人格、默认人格、「无人格」标记），旧版本退化为 会话人格 → 默认人格。
+        """
+        try:
+            pm = getattr(self.context, "persona_manager", None)
+            if pm is None:
+                return None
+            conv_pid = None
+            cm = getattr(self.context, "conversation_manager", None)
+            if cm is not None:
+                cid = await cm.get_curr_conversation_id(umo)
+                if cid:
+                    conv = await cm.get_conversation(umo, cid)
+                    conv_pid = getattr(conv, "persona_id", None)
+            if conv_pid == "[%None]":  # 用户显式设置无人格
+                return None
+            if hasattr(pm, "resolve_selected_persona"):
+                platform = umo.split(":", 1)[0] if ":" in umo else ""
+                _, persona, _, _ = await pm.resolve_selected_persona(
+                    umo=umo,
+                    conversation_persona_id=conv_pid,
+                    platform_name=platform,
+                )
+                return persona.get("prompt") if persona else None
+            if conv_pid and hasattr(pm, "get_persona_v3_by_id"):
+                persona = pm.get_persona_v3_by_id(conv_pid)
+                if persona:
+                    return persona.get("prompt")
+            if hasattr(pm, "get_default_persona_v3"):
+                persona = await pm.get_default_persona_v3(umo)
+                if persona:
+                    return persona.get("prompt")
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"[icloud_calendar] 每日提醒解析人格失败，按无人格处理：{e}")
+        return None
 
     def _format_daily(self, items: list[dict], now: datetime) -> str:
         weekday = "一二三四五六日"[now.weekday()]

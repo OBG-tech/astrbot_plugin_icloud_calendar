@@ -71,6 +71,12 @@
     "hint": "24 小时制 HH:MM（按上面的时区），例如 08:00",
     "default": "08:00"
   },
+  "daily_reminder_use_llm": {
+    "description": "播报内容由大模型按人格生成",
+    "type": "bool",
+    "hint": "开启后，每日提醒的文案由当前会话的大模型按人格(persona)风格撰写；未配置大模型或生成失败时自动回退到固定模板。关闭则始终使用固定模板",
+    "default": true
+  },
   "daily_reminder_session": {
     "description": "提醒发送目标（会话标识）",
     "type": "string",
