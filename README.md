@@ -33,11 +33,13 @@ LLM 函数工具（`@filter.llm_tool`），大模型在对话中识别到日程�
 
 1. 把本目录放到 AstrBot 的插件目录：`AstrBot/data/plugins/astrbot_plugin_icloud_calendar/`
    （或在 WebUI 插件市场填入仓库地址安装）。
-2. 安装依赖（AstrBot 一般会自动安装 `requirements.txt`；如未自动安装，手动执行）：
+2. 安装依赖：插件加载时会用 AstrBot 当前运行的 Python 自动执行
+   `pip install -r requirements.txt`（默认源失败时自动回退清华镜像），
+   一般无需手动操作；依赖为 `caldav`、`icalendar`、`tzdata`。
+   自动安装失败时可手动执行（日志中有具体原因）：
    ```bash
    pip install -r requirements.txt
    ```
-   依赖：`caldav`、`icalendar`、`tzdata`。
 3. 在 AstrBot WebUI 重载 / 启用插件。
 
 > 需要 AstrBot 支持 `@filter.llm_tool` 的较新版本，并已在「服务提供商」中配置可用的

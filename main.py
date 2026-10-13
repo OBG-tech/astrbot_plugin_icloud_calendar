@@ -36,7 +36,8 @@ try:
 except ImportError:  # pragma: no cover - AstrBot 要求 Python 3.10+
     ZoneInfo = None  # type: ignore
 
-# 第三方依赖延迟到模块级 try 导入，缺失时给出友好提示而不是直接让插件加载崩溃。
+# 第三方依赖延迟到模块级 try 导入，缺失时不让插件加载崩溃；
+# initialize() 中会再尝试自动安装（见 _ensure_deps）。
 try:
     import caldav
     import icalendar
@@ -46,6 +47,65 @@ except Exception as _e:  # noqa: BLE001
     caldav = None  # type: ignore
     icalendar = None  # type: ignore
     _IMPORT_ERROR = str(_e)
+
+
+def _ensure_deps():
+    """确保 caldav / icalendar 可用，缺失时自动安装后重试导入。
+
+    关键点：始终用 ``sys.executable -m pip``，即 AstrBot 正在运行的同一个
+    Python 解释器，因此无论 AstrBot 跑在 venv / 系统 Python / Docker 容器里，
+    依赖都会装进正确的环境，不依赖宿主机或镜像的预配置。
+    同步阻塞函数，应通过 ``asyncio.to_thread`` 调用。
+
+    返回 ``(caldav, icalendar, error)``；成功时 error 为 None。
+    """
+    import importlib
+    import subprocess
+    import sys
+
+    def _try_import():
+        try:
+            importlib.invalidate_caches()
+            import caldav as cd
+            import icalendar as ic
+
+            return cd, ic, None
+        except Exception as e:  # noqa: BLE001
+            return None, None, str(e)
+
+    cd, ic, err = _try_import()
+    if err is None:
+        return cd, ic, None
+    first_err = err
+
+    req = os.path.join(os.path.dirname(__file__), "requirements.txt")
+    attempts = [
+        [sys.executable, "-m", "pip", "install", "-r", req],
+        # 默认源失败（国内网络常见）时回退到清华镜像
+        [sys.executable, "-m", "pip", "install", "-r", req,
+         "-i", "https://pypi.tuna.tsinghua.edu.cn/simple"],
+    ]
+    last_log = ""
+    for cmd in attempts:
+        logger.info(f"[icloud_calendar] 正在自动安装依赖：{' '.join(cmd)}")
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+        except Exception as e:  # noqa: BLE001
+            last_log = str(e)
+            continue
+        if r.returncode == 0:
+            cd, ic, err = _try_import()
+            if err is None:
+                logger.info("[icloud_calendar] 依赖自动安装成功。")
+                return cd, ic, None
+            last_log = f"安装成功但导入仍失败：{err}"
+        else:
+            last_log = (r.stderr or r.stdout or "").strip()[-500:]
+        logger.warning(f"[icloud_calendar] 自动安装依赖未成功：{last_log}")
+    return None, None, (
+        f"自动安装依赖失败：{last_log or first_err}。"
+        f"可手动执行：{sys.executable} -m pip install -r {req}"
+    )
 
 
 DEFAULT_GUIDE = (
@@ -120,11 +180,15 @@ class ICloudCalendarPlugin(Star):
             logger.warning(f"[icloud_calendar] 读取 SKILL.md 失败，使用内置引导：{e}")
 
         if _IMPORT_ERROR:
-            logger.error(
-                "[icloud_calendar] 依赖未安装（%s）。请在插件目录执行："
-                "pip install -r requirements.txt",
-                _IMPORT_ERROR,
-            )
+            # 模块级导入失败：用当前解释器自动安装依赖后重试（不阻塞事件循环）。
+            global caldav, icalendar
+            caldav, icalendar, err = await asyncio.to_thread(_ensure_deps)
+            if err is None:
+                globals()["_IMPORT_ERROR"] = None
+                logger.info("[icloud_calendar] 依赖已就绪。")
+            else:
+                globals()["_IMPORT_ERROR"] = err
+                logger.error(f"[icloud_calendar] 依赖不可用：{err}")
 
         # 启动每日提醒后台任务（内部按配置决定是否真正发送）。
         if self._reminder_task is None:
@@ -1069,8 +1133,8 @@ class ICloudCalendarPlugin(Star):
     def _dep_guard(self) -> str | None:
         if _IMPORT_ERROR:
             return (
-                "iCloud 日历插件依赖未安装（caldav / icalendar）。"
-                "请在插件目录执行：pip install -r requirements.txt 后重载插件。"
+                "iCloud 日历插件依赖不可用（已尝试自动安装）。"
+                f"原因：{_IMPORT_ERROR}"
             )
         return None
 
